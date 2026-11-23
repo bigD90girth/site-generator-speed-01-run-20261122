@@ -30,11 +30,30 @@ const cases = JSON.parse(readFileSync(join(inDir, 'cases.json'), 'utf8')) as Arr
 // held in memory together, and the big stringified whole is never built.
 // The bytes written are exactly JSON.stringify of the answers array:
 // '[' + each answer's JSON, comma-separated + ']'.
+//
+// The answers object is flat { path: html }, and a path never holds a
+// character JSON escapes (slugs, fixed directory and static names), so the
+// keys are quoted by hand and each value goes through JSON.stringify on
+// its own. One array push per entry, joined once: the join flattens in a
+// single cache-friendly pass, which measured consistently faster than
+// stringifying the whole object at once on the practice set.
+function stringifyAnswer(out) {
+  const parts = ['{'];
+  let first = true;
+  for (const k in out) {
+    if (!first) parts.push(',');
+    first = false;
+    parts.push('"' + k + '":' + JSON.stringify(out[k]));
+  }
+  parts.push('}');
+  return parts.join('');
+}
+
 const fd = openSync(join(outDir, 'answers.json'), 'w');
 writeSync(fd, '[');
 for (let i = 0; i < cases.length; i++) {
   if (i > 0) writeSync(fd, ',');
-  writeSync(fd, JSON.stringify(run(cases[i].input)));
+  writeSync(fd, stringifyAnswer(run(cases[i].input)));
 }
 writeSync(fd, ']');
 closeSync(fd);

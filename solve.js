@@ -30,26 +30,37 @@ function slugOf(text) {
   const decomposed = /[^\x00-\x7F]/.test(text)
     ? text.normalize('NFKD').replace(/\p{M}/gu, '')
     : text;
-  const parts = [];
+  let out = '';
   let dashed = true;
   for (let i = 0; i < decomposed.length; i++) {
     let c = decomposed.charCodeAt(i);
     if (c >= 65 && c <= 90) c += 32;
     if ((c >= 97 && c <= 122) || (c >= 48 && c <= 57)) {
-      parts.push(String.fromCharCode(c));
+      out += String.fromCharCode(c);
       dashed = false;
     } else if (!dashed) {
-      parts.push('-');
+      out += '-';
       dashed = true;
     }
   }
-  let out = parts.join('');
   if (dashed && out.length > 0) out = out.slice(0, -1);
   if (out.length > 64) {
     out = out.slice(0, 64);
     if (out.charCodeAt(out.length - 1) === 45) out = out.slice(0, -1);
   }
   return out === '' ? 'untitled' : out;
+}
+
+// Tag names repeat across posts (a fixed list of a few dozen), so their
+// slugs are memoized; titles and headings are unique and are not cached.
+const TAG_SLUGS = new Map();
+function tagSlug(name) {
+  let s = TAG_SLUGS.get(name);
+  if (s === undefined) {
+    s = slugOf(name);
+    TAG_SLUGS.set(name, s);
+  }
+  return s;
 }
 
 // '2026-11-09' -> '9 November 2026', from the string alone.
@@ -409,20 +420,20 @@ function lookupPath(root, frames, names) {
   let found = false;
   for (let i = frames.length - 1; i >= 0; i--) {
     const f = frames[i].bind;
-    if (Object.prototype.hasOwnProperty.call(f, first)) {
+    if (Object.hasOwn(f, first)) {
       v = f[first];
       found = true;
       break;
     }
   }
   if (!found) {
-    if (!Object.prototype.hasOwnProperty.call(root, first)) return undefined;
+    if (!Object.hasOwn(root, first)) return undefined;
     v = root[first];
   }
   for (let i = 1; i < names.length; i++) {
     if (v === null || v === undefined || typeof v !== 'object') return undefined;
     const nm = names[i];
-    if (!Object.prototype.hasOwnProperty.call(v, nm)) return undefined;
+    if (!Object.hasOwn(v, nm)) return undefined;
     v = v[nm];
   }
   return v;
@@ -444,7 +455,7 @@ function writeValue(v, out) {
 }
 
 function writeValueEsc(v, out) {
-  if (typeof v === 'string') pushEsc(v, out);
+  if (typeof v === 'string') pushEsc(v, 0, v.length, out);
   else if (typeof v === 'number') out.push(String(v));
   else if (typeof v === 'boolean') out.push(v ? 'true' : 'false');
   else if (Array.isArray(v)) {
@@ -530,13 +541,18 @@ function renderCompiled(code, compiled, root, out, depth, frames) {
 // Render a template by name (when it parsed) into a string. The top
 // render is depth 0: an include renders its template one deeper, while
 // the depth is under 8, so a template 8 deep still renders and one deeper
-// does not.
+// does not. The chunk array and the scope stack are scratch space reused
+// across renders: renderTemplate is never re-entered (includes call
+// renderCompiled directly), and both are empty again when a render ends.
+const RENDER_OUT = [];
+const RENDER_FRAMES = [];
 function renderTemplate(name, compiled, root) {
   const code = compiled[name];
   if (!code) return '';
-  const out = [];
-  renderCompiled(code, compiled, root, out, 0, []);
-  return out.join('');
+  RENDER_OUT.length = 0;
+  RENDER_FRAMES.length = 0;
+  renderCompiled(code, compiled, root, RENDER_OUT, 0, RENDER_FRAMES);
+  return RENDER_OUT.join('');
 }
 
 // ------------------------------------------------------------------ markdown
@@ -553,17 +569,17 @@ function isEscapableCode(c) {
 
 // Find the next '**' at or after from, skipping escaped pairs only: the
 // next '**' closes the strong, even one a backtick opened a span over.
-// Returns the index or -1.
-function findStrong(s, from) {
+// Searches only inside [from, hi): the range an inlineInto call owns, so a
+// closer past its end is not one. Returns the index or -1.
+function findStrong(s, from, hi) {
   let j = from;
-  const n = s.length;
-  while (j < n) {
+  while (j < hi) {
     const c = s.charCodeAt(j);
-    if (c === 92 && j + 1 < n && isEscapableCode(s.charCodeAt(j + 1))) {
+    if (c === 92 && j + 1 < hi && isEscapableCode(s.charCodeAt(j + 1))) {
       j += 2;
       continue;
     }
-    if (c === 42 && s.charCodeAt(j + 1) === 42) return j;
+    if (c === 42 && j + 1 < hi && s.charCodeAt(j + 1) === 42) return j;
     j++;
   }
   return -1;
@@ -574,18 +590,18 @@ function findStrong(s, from) {
 // are each one unit, so a '*' that follows a '**' pair is a lone '*' and a
 // valid closer (its neighbour belongs to the pair, not to it). A backtick
 // is an ordinary character here: the next '*' closes the emphasis even
-// inside what a backtick opened. Returns the index or -1.
-function findEm(s, from) {
+// inside what a backtick opened. Searches only inside [from, hi).
+// Returns the index or -1.
+function findEm(s, from, hi) {
   let j = from;
-  const n = s.length;
-  while (j < n) {
+  while (j < hi) {
     const c = s.charCodeAt(j);
-    if (c === 92 && j + 1 < n && isEscapableCode(s.charCodeAt(j + 1))) {
+    if (c === 92 && j + 1 < hi && isEscapableCode(s.charCodeAt(j + 1))) {
       j += 2;
       continue;
     }
     if (c === 42) {
-      if (s.charCodeAt(j + 1) === 42) {
+      if (j + 1 < hi && s.charCodeAt(j + 1) === 42) {
         j += 2;
         continue;
       }
@@ -599,14 +615,14 @@ function findEm(s, from) {
 // Read a link starting at s[i] === '[' far enough to know it is one:
 // its text end, its target end and its target. Returns null when s[i]
 // opens no link. Pure: it neither resolves the href nor renders the text,
-// so the caller can flush the plain run before it first.
-function linkParts(s, i) {
-  const n = s.length;
+// so the caller can flush the plain run before it first. Searches only
+// inside [i, hi).
+function linkParts(s, i, hi) {
   let j = i + 1;
   let textEnd = -1;
-  while (j < n) {
+  while (j < hi) {
     const c = s.charCodeAt(j);
-    if (c === 92 && j + 1 < n && isEscapableCode(s.charCodeAt(j + 1))) {
+    if (c === 92 && j + 1 < hi && isEscapableCode(s.charCodeAt(j + 1))) {
       j += 2;
       continue;
     }
@@ -617,10 +633,10 @@ function linkParts(s, i) {
     j++;
   }
   if (textEnd === -1) return null;
-  if (s[textEnd + 1] !== '(') return null;
+  if (textEnd + 1 >= hi || s[textEnd + 1] !== '(') return null;
   const tStart = textEnd + 2;
   const tEnd = s.indexOf(')', tStart);
-  if (tEnd === -1) return null;
+  if (tEnd === -1 || tEnd >= hi) return null;
   const target = s.slice(tStart, tEnd);
   if (target === '' || /\s/.test(target)) return null;
   return { textEnd, tEnd, target };
@@ -675,34 +691,35 @@ function resolveHref(target, ctx) {
   return target;
 }
 
-// HTML-escape s into out (an array of chunks): the five replacements of
-// the reference's table. One regex scan that pushes raw runs and entities
-// beats a test plus a replace with a callback per match, and writing into
-// the caller's array instead of allocating a joined string keeps the
-// caller from paying for a string of its own.
+// HTML-escape s[lo, hi) into out (an array of chunks): the five
+// replacements of the reference's table. One regex scan that pushes raw
+// runs and entities beats a test plus a replace with a callback per match,
+// and writing into the caller's array instead of allocating a joined
+// string keeps the caller from paying for a string of its own.
 const ESC_RE_G = /[&<>"']/g;
-function pushEsc(s, out) {
-  ESC_RE_G.lastIndex = 0;
+function pushEsc(s, lo, hi, out) {
+  ESC_RE_G.lastIndex = lo;
   let m;
-  let start = 0;
+  let start = lo;
   while ((m = ESC_RE_G.exec(s)) !== null) {
+    if (m.index >= hi) break;
     if (m.index > start) out.push(s.slice(start, m.index));
     out.push(ESCAPES[m[0]]);
     start = m.index + 1;
   }
-  if (start < s.length) out.push(s.slice(start));
+  if (start < hi) out.push(s.slice(start, hi));
 }
 
 // The next character that is either an inline special (backslash,
 // backtick, '*' or '[') or an HTML-escapable (& < > " '), at or after
-// from, or -1. One regex scan handles both: plain runs between matches
-// hold neither, so they are pushed raw, and escapables become entities
-// on the spot instead of paying an esc() call per run.
+// from and before hi, or -1. One regex scan handles both: plain runs
+// between matches hold neither, so they are pushed raw, and escapables
+// become entities on the spot instead of paying an esc() call per run.
 const SCAN_RE_G = /[\\`*\[]|[&<>"']/g;
-function nextScan(s, from) {
+function nextScan(s, from, hi) {
   SCAN_RE_G.lastIndex = from;
   const m = SCAN_RE_G.exec(s);
-  return m ? m.index : -1;
+  return m && m.index < hi ? m.index : -1;
 }
 
 // Inline Markdown into out (an array of chunks), left to right: escapes,
@@ -712,12 +729,15 @@ function nextScan(s, from) {
 // entities inline; writing into the caller's array instead of joining a
 // string of its own keeps every nested span from allocating an array and
 // a string.
-function inlineInto(s, ctx, out) {
-  let i = 0;
-  const n = s.length;
-  let bufStart = 0;
+//
+// The scan owns the range s[lo, hi): nested spans recurse on a sub-range
+// of the same string instead of slicing it out, so no span allocates a
+// substring of its own.
+function inlineInto(s, ctx, out, lo, hi) {
+  let i = lo;
+  let bufStart = lo;
   while (true) {
-    const j = nextScan(s, i);
+    const j = nextScan(s, i, hi);
     if (j === -1) break;
     i = j;
     const c = s.charCodeAt(i);
@@ -730,7 +750,7 @@ function inlineInto(s, ctx, out) {
       continue;
     }
     if (c === 92) {
-      if (i + 1 < n && isEscapableCode(s.charCodeAt(i + 1))) {
+      if (i + 1 < hi && isEscapableCode(s.charCodeAt(i + 1))) {
         if (i > bufStart) out.push(s.slice(bufStart, i));
         out.push(s[i + 1]);
         i += 2;
@@ -742,10 +762,10 @@ function inlineInto(s, ctx, out) {
     }
     if (c === 96) {
       const k = s.indexOf('`', i + 1);
-      if (k !== -1 && k > i + 1) {
+      if (k !== -1 && k < hi && k > i + 1) {
         if (i > bufStart) out.push(s.slice(bufStart, i));
         out.push('<code>');
-        pushEsc(s.slice(i + 1, k), out);
+        pushEsc(s, i + 1, k, out);
         out.push('</code>');
         i = k + 1;
         bufStart = i;
@@ -755,12 +775,12 @@ function inlineInto(s, ctx, out) {
       continue;
     }
     if (c === 42) {
-      if (s.charCodeAt(i + 1) === 42) {
-        const k = findStrong(s, i + 2);
+      if (i + 1 < hi && s.charCodeAt(i + 1) === 42) {
+        const k = findStrong(s, i + 2, hi);
         if (k !== -1 && k > i + 2) {
           if (i > bufStart) out.push(s.slice(bufStart, i));
           out.push('<strong>');
-          inlineInto(s.slice(i + 2, k), ctx, out);
+          inlineInto(s, ctx, out, i + 2, k);
           out.push('</strong>');
           i = k + 2;
           bufStart = i;
@@ -768,11 +788,11 @@ function inlineInto(s, ctx, out) {
           i += 2;
         }
       } else {
-        const k = findEm(s, i + 1);
+        const k = findEm(s, i + 1, hi);
         if (k !== -1 && k > i + 1) {
           if (i > bufStart) out.push(s.slice(bufStart, i));
           out.push('<em>');
-          inlineInto(s.slice(i + 1, k), ctx, out);
+          inlineInto(s, ctx, out, i + 1, k);
           out.push('</em>');
           i = k + 1;
           bufStart = i;
@@ -783,14 +803,14 @@ function inlineInto(s, ctx, out) {
       continue;
     }
     // c === 91, a '[' that may open a link.
-    const lp = linkParts(s, i);
+    const lp = linkParts(s, i, hi);
     if (lp) {
       const href = resolveHref(lp.target, ctx);
       if (i > bufStart) out.push(s.slice(bufStart, i));
       out.push('<a href="');
-      pushEsc(href, out);
+      pushEsc(href, 0, href.length, out);
       out.push('">');
-      inlineInto(s.slice(i + 1, lp.textEnd), ctx, out);
+      inlineInto(s, ctx, out, i + 1, lp.textEnd);
       out.push('</a>');
       i = lp.tEnd + 1;
       bufStart = i;
@@ -798,7 +818,7 @@ function inlineInto(s, ctx, out) {
       i++;
     }
   }
-  if (n > bufStart) out.push(s.slice(bufStart));
+  if (hi > bufStart) out.push(s.slice(bufStart, hi));
 }
 
 // Inline Markdown to a string: the same scan, joined. Only the callers
@@ -806,7 +826,7 @@ function inlineInto(s, ctx, out) {
 // excerpt) use this; the rest write straight into their own array.
 function inline(s, ctx) {
   const out = [];
-  inlineInto(s, ctx, out);
+  inlineInto(s, ctx, out, 0, s.length);
   return out.join('');
 }
 
@@ -907,6 +927,49 @@ function listMarker(line) {
   return { ordered: true, num: Number(line.slice(0, i)), text: line.slice(i + 2) };
 }
 
+// Render a list starting at lines[i] with marker lm; returns the index
+// just past the list.
+function listBlock(lines, i, n, lm, ctx, out) {
+  const ordered = lm.ordered;
+  const startNum = lm.num;
+  const items = [];
+  let cur = lm.text;
+  i++;
+  while (i < n) {
+    const l = lines[i];
+    const m2 = listMarker(l);
+    if (m2 && m2.ordered === ordered) {
+      items.push(cur);
+      cur = m2.text;
+      i++;
+      continue;
+    }
+    // A line of two or more spaces then a non-space continues the item.
+    let sp = 0;
+    while (sp < l.length && (l[sp] === ' ' || l[sp] === '\t')) sp++;
+    if (sp >= 2 && trimLine(l) !== '') {
+      cur += '\n' + trimLine(l);
+      i++;
+      continue;
+    }
+    break;
+  }
+  items.push(cur);
+  if (ordered) {
+    out.push(startNum !== 1 ? '<ol start="' + startNum + '">\n' : '<ol>\n');
+  } else {
+    out.push('<ul>\n');
+  }
+  for (let k = 0; k < items.length; k++) {
+    out.push('<li>');
+    const item = items[k];
+    inlineInto(item, ctx, out, 0, item.length);
+    out.push('</li>\n');
+  }
+  out.push(ordered ? '</ol>\n' : '</ul>\n');
+  return i;
+}
+
 // Render one body to HTML. Takes the source's split lines and the index of
 // the first body line (after the closing front-matter fence) instead of a
 // joined body string, so the caller never has to join the lines back
@@ -920,46 +983,64 @@ function renderMarkdown(lines, start, ctx) {
   const n = lines.length;
   while (i < n) {
     const line = lines[i];
-    if (isBlank(line)) {
+    if (line.length === 0) {
       i++;
       continue;
     }
-    const lang = fenceLang(line);
-    if (lang !== null) {
-      i++;
-      out.push('<pre><code');
-      if (lang !== '') out.push(' class="language-', lang, '"');
-      out.push('>');
-      while (i < n && !isFenceClose(lines[i])) {
-        pushEsc(lines[i], out);
-        out.push('\n');
+    const c0 = line.charCodeAt(0);
+    // Dispatch on the first character: most lines are paragraph text, and
+    // each block kind can only start with its own characters, so the other
+    // checks never run for them. A line that matches none of the kinds
+    // falls through to the paragraph below.
+    if (c0 === 32 || c0 === 9) {
+      if (isBlank(line)) {
         i++;
+        continue;
       }
-      if (i < n) i++;
-      out.push('</code></pre>\n');
-      continue;
-    }
-    const h = headingOf(line);
-    if (h) {
-      let id = slugOf(h.text);
-      if (headIds.has(id)) {
-        let k = 2;
-        while (headIds.has(id + '-' + k)) k++;
-        id = id + '-' + k;
+    } else if (c0 === 96) {
+      const lang = fenceLang(line);
+      if (lang !== null) {
+        i++;
+        out.push('<pre><code');
+        if (lang !== '') out.push(' class="language-', lang, '"');
+        out.push('>');
+        while (i < n && !isFenceClose(lines[i])) {
+          pushEsc(lines[i], 0, lines[i].length, out);
+          out.push('\n');
+          i++;
+        }
+        if (i < n) i++;
+        out.push('</code></pre>\n');
+        continue;
       }
-      headIds.add(id);
-      const html = inline(h.text, ctx);
-      if (h.level === 2 || h.level === 3) toc.push({ level: h.level, id, html });
-      out.push('<h', String(h.level), ' id="', id, '">', html, '</h', String(h.level), '>\n');
-      i++;
-      continue;
-    }
-    if (isBreak(line)) {
-      out.push('<hr>\n');
-      i++;
-      continue;
-    }
-    if (line[0] === '>') {
+    } else if (c0 === 35) {
+      const h = headingOf(line);
+      if (h) {
+        let id = slugOf(h.text);
+        if (headIds.has(id)) {
+          let k = 2;
+          while (headIds.has(id + '-' + k)) k++;
+          id = id + '-' + k;
+        }
+        headIds.add(id);
+        const html = inline(h.text, ctx);
+        if (h.level === 2 || h.level === 3) toc.push({ level: h.level, id, html });
+        out.push('<h', String(h.level), ' id="', id, '">', html, '</h', String(h.level), '>\n');
+        i++;
+        continue;
+      }
+    } else if (c0 === 45 || c0 === 42) {
+      if (isBreak(line)) {
+        out.push('<hr>\n');
+        i++;
+        continue;
+      }
+      const lm = listMarker(line);
+      if (lm) {
+        i = listBlock(lines, i, n, lm, ctx, out);
+        continue;
+      }
+    } else if (c0 === 62) {
       const q = [];
       while (i < n && lines[i][0] === '>') {
         let t = lines[i].slice(1);
@@ -970,52 +1051,19 @@ function renderMarkdown(lines, start, ctx) {
       }
       if (q.length > 0) {
         out.push('<blockquote>\n<p>');
-        inlineInto(q.join('\n'), ctx, out);
+        const joined = q.join('\n');
+        inlineInto(joined, ctx, out, 0, joined.length);
         out.push('</p>\n</blockquote>\n');
       } else {
         out.push('<blockquote>\n</blockquote>\n');
       }
       continue;
-    }
-    const lm = listMarker(line);
-    if (lm) {
-      const ordered = lm.ordered;
-      const startNum = lm.num;
-      const items = [];
-      let cur = lm.text;
-      i++;
-      while (i < n) {
-        const l = lines[i];
-        const m2 = listMarker(l);
-        if (m2 && m2.ordered === ordered) {
-          items.push(cur);
-          cur = m2.text;
-          i++;
-          continue;
-        }
-        // A line of two or more spaces then a non-space continues the item.
-        let sp = 0;
-        while (sp < l.length && (l[sp] === ' ' || l[sp] === '\t')) sp++;
-        if (sp >= 2 && trimLine(l) !== '') {
-          cur += '\n' + trimLine(l);
-          i++;
-          continue;
-        }
-        break;
+    } else if (c0 >= 48 && c0 <= 57) {
+      const lm = listMarker(line);
+      if (lm) {
+        i = listBlock(lines, i, n, lm, ctx, out);
+        continue;
       }
-      items.push(cur);
-      if (ordered) {
-        out.push(startNum !== 1 ? '<ol start="' + startNum + '">\n' : '<ol>\n');
-      } else {
-        out.push('<ul>\n');
-      }
-      for (let k = 0; k < items.length; k++) {
-        out.push('<li>');
-        inlineInto(items[k], ctx, out);
-        out.push('</li>\n');
-      }
-      out.push(ordered ? '</ol>\n' : '</ul>\n');
-      continue;
     }
     // A paragraph: this line and the lines after it up to a blank line, a
     // fence, a heading or a thematic break. Most lines are plain text, so
@@ -1045,7 +1093,8 @@ function renderMarkdown(lines, start, ctx) {
       out.push('<p>', inner, '</p>\n');
     } else {
       out.push('<p>');
-      inlineInto(plines.join('\n'), ctx, out);
+      const joined = plines.join('\n');
+      inlineInto(joined, ctx, out, 0, joined.length);
       out.push('</p>\n');
     }
   }
@@ -1172,7 +1221,12 @@ export function run(input) {
         fault.reason = 'line ' + n + ' is not "key: value"';
         break;
       }
-      const value = rest === '' ? '' : rest.slice(1).replace(/[ \t]+$/, '');
+      const value = rest === '' ? '' : rest.slice(1);
+      // Trailing spaces/tabs are rare, so check the last character first
+      // instead of running a regex over every value.
+      let ev = value.length;
+      while (ev > 0 && (value.charCodeAt(ev - 1) === 32 || value.charCodeAt(ev - 1) === 9)) ev--;
+      const trimmed = ev < value.length ? value.slice(0, ev) : value;
       if (!KNOWN_KEYS.has(key)) {
         fault.reason = 'unknown key "' + key + '"';
         break;
@@ -1181,11 +1235,11 @@ export function run(input) {
         fault.reason = 'key "' + key + '" is given twice';
         break;
       }
-      if (value === '') {
+      if (trimmed === '') {
         fault.reason = 'key "' + key + '" has no value';
         break;
       }
-      const parsed = valueOf(key, value, fault);
+      const parsed = valueOf(key, trimmed, fault);
       if (fault.reason) break;
       seen.add(key);
       fm[key] = parsed;
@@ -1296,13 +1350,13 @@ export function run(input) {
   // count, most first, then by slug.
   const tagBySlug = new Map();
   for (const p of posts) {
-    const seen = new Set();
+    const seen = [];
     const tags = [];
     const raw = p.fm.tags || [];
     for (const name of raw) {
-      const slug = slugOf(name);
-      if (seen.has(slug)) continue;
-      seen.add(slug);
+      const slug = tagSlug(name);
+      if (seen.indexOf(slug) !== -1) continue;
+      seen.push(slug);
       tags.push({ name, slug });
     }
     p.tagList = tags;
@@ -1316,13 +1370,13 @@ export function run(input) {
     }
   }
   for (const pg of pages) {
-    const seen = new Set();
+    const seen = [];
     const tags = [];
     const raw = pg.fm.tags || [];
     for (const name of raw) {
-      const slug = slugOf(name);
-      if (seen.has(slug)) continue;
-      seen.add(slug);
+      const slug = tagSlug(name);
+      if (seen.indexOf(slug) !== -1) continue;
+      seen.push(slug);
       tags.push({ name, slug });
     }
     pg.tagList = tags;
@@ -1364,26 +1418,29 @@ export function run(input) {
     if (!p) return null;
     return { title: p.fm.title, url: p.url, date: p.fm.date || '', date_long: p.fm.date ? dateLong(p.fm.date) : '' };
   }
+  // The page is the card with its page fields added: the card is only
+  // ever read by templates, which read named fields, so the extra fields
+  // on it are invisible to every render that uses it as a card.
   for (let i = 0; i < posts.length; i++) {
     const p = posts[i];
-    p.page = Object.assign({}, p.card, {
-      slug: p.slug,
-      content: p.content,
-      toc: p.toc,
-      newer: neighbourOf(posts[i - 1], i),
-      older: neighbourOf(posts[i + 1], i),
-      is_post: true,
-    });
+    const pg = p.card;
+    pg.slug = p.slug;
+    pg.content = p.content;
+    pg.toc = p.toc;
+    pg.newer = neighbourOf(posts[i - 1], i);
+    pg.older = neighbourOf(posts[i + 1], i);
+    pg.is_post = true;
+    p.page = pg;
   }
   for (const pg of pages) {
-    pg.page = Object.assign({}, pg.card, {
-      slug: pg.slug,
-      content: pg.content,
-      toc: pg.toc,
-      newer: null,
-      older: null,
-      is_post: false,
-    });
+    const c = pg.card;
+    c.slug = pg.slug;
+    c.content = pg.content;
+    c.toc = pg.toc;
+    c.newer = null;
+    c.older = null;
+    c.is_post = false;
+    pg.page = c;
   }
 
   const siteValue = { title: site.title, base_url: base };
@@ -1391,9 +1448,12 @@ export function run(input) {
 
   // 8. Layouts.
   const written = new Set();
+  // One root object reused for every page render: renderTemplate only
+  // reads it during the call, so swapping .page between renders is safe.
+  const pageRoot = { site: siteValue, tags: tagsValue, recent: recentCards, page: null };
   for (const s of kept) {
-    const root = { site: siteValue, tags: tagsValue, recent: recentCards, page: s.page };
-    out[s.outPath] = renderTemplate(s.layout, compiled, root);
+    pageRoot.page = s.page;
+    out[s.outPath] = renderTemplate(s.layout, compiled, pageRoot);
     written.add(s.outPath);
   }
   const perPageN = perPage < 1 ? 1 : perPage;
