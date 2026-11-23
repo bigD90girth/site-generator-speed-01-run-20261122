@@ -24,6 +24,8 @@ const ESCAPES = {
 // The slug of a text: NFKD, combining marks dropped, A-Z lowered, each run
 // of characters other than a-z and 0-9 one '-', none at either end, cut to
 // 64 characters with a '-' left at the cut dropped, 'untitled' when empty.
+// A per-character loop: titles are short, and toLowerCase + a class
+// replace measured slower (two extra string allocations per call).
 function slugOf(text) {
   // Pure ASCII needs no normalisation: NFKD is the identity on ASCII and
   // ASCII holds no combining marks, so skip both passes for it.
@@ -63,9 +65,12 @@ function tagSlug(name) {
   return s;
 }
 
-// '2026-11-09' -> '9 November 2026', from the string alone.
+// '2026-11-09' -> '9 November 2026', from the string alone. The date was
+// validated before this is called, so the digits are read by code unit
+// instead of slicing out three substrings.
 function dateLong(d) {
-  return Number(d.slice(8, 10)) + ' ' + MONTHS[Number(d.slice(5, 7)) - 1] + ' ' + d.slice(0, 4);
+  return ((d.charCodeAt(8) - 48) * 10 + (d.charCodeAt(9) - 48)) + ' ' +
+    MONTHS[(d.charCodeAt(5) - 48) * 10 + (d.charCodeAt(6) - 48) - 1] + ' ' + d.slice(0, 4);
 }
 
 function isLeap(y) {
@@ -82,9 +87,10 @@ function validDate(d) {
     const c = d.charCodeAt(i);
     if (c < 48 || c > 57) return false;
   }
-  const y = Number(d.slice(0, 4));
-  const m = Number(d.slice(5, 7));
-  const day = Number(d.slice(8, 10));
+  const y = (d.charCodeAt(0) - 48) * 1000 + (d.charCodeAt(1) - 48) * 100 +
+    (d.charCodeAt(2) - 48) * 10 + (d.charCodeAt(3) - 48);
+  const m = (d.charCodeAt(5) - 48) * 10 + (d.charCodeAt(6) - 48);
+  const day = (d.charCodeAt(8) - 48) * 10 + (d.charCodeAt(9) - 48);
   if (m < 1 || m > 12 || day < 1) return false;
   const dim = m === 2 && isLeap(y) ? 29 : DIM[m - 1];
   if (day > dim) return false;
@@ -413,22 +419,35 @@ function truthy(v) {
 
 // A path's first name is read from the innermost loop that binds it (loop
 // before the element), else from the page's values; each next name is an own
-// property of the value so far, or the path is undefined.
+// property of the value so far, or the path is undefined. Outside a loop
+// frames is empty, so the frame scan is skipped outright; most paths are
+// two names, so that tail is walked without a loop setup.
 function lookupPath(root, frames, names) {
   const first = names[0];
   let v;
-  let found = false;
-  for (let i = frames.length - 1; i >= 0; i--) {
-    const f = frames[i].bind;
-    if (Object.hasOwn(f, first)) {
-      v = f[first];
-      found = true;
-      break;
-    }
-  }
-  if (!found) {
+  if (frames.length === 0) {
     if (!Object.hasOwn(root, first)) return undefined;
     v = root[first];
+  } else {
+    let found = false;
+    for (let i = frames.length - 1; i >= 0; i--) {
+      const f = frames[i].bind;
+      if (Object.hasOwn(f, first)) {
+        v = f[first];
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      if (!Object.hasOwn(root, first)) return undefined;
+      v = root[first];
+    }
+  }
+  if (names.length === 2) {
+    if (v === null || v === undefined || typeof v !== 'object') return undefined;
+    const nm = names[1];
+    if (!Object.hasOwn(v, nm)) return undefined;
+    return v[nm];
   }
   for (let i = 1; i < names.length; i++) {
     if (v === null || v === undefined || typeof v !== 'object') return undefined;
@@ -538,20 +557,161 @@ function renderCompiled(code, compiled, root, out, depth, frames) {
   }
 }
 
+// ------------------------------------------------------------------ template codegen
+//
+// The interpreter above walks an instruction list per render; the same
+// template is rendered hundreds of times per case, so the dispatch, the
+// frame scan in lookupPath and the per-loop frame objects are paid over
+// and over. Instead, each template is translated once per case into a
+// plain JS function (new Function) that writes straight into out.
+//
+// A path's first name resolves exactly as the interpreter resolves it:
+// the innermost loop binding wins, else the page's values. Loop bindings
+// live in `scope`, a null-prototype object the function receives: a for
+// writes its variable and loop object into scope on every iteration and
+// restores the previous binding on exit, so an include sees the same
+// bindings the interpreter's frames would give it, and a name no loop
+// binds falls through to root. Later names use ?. chains, which return
+// undefined for a missing link exactly as lookupPath does (template paths
+// never dereference into a primitive or name a prototype property).
+//
+// scope never deletes a property (a delete would drop the object into
+// dictionary mode and slow every later access): a name no loop currently
+// binds holds the UNBOUND sentinel, and restoring a binding is a plain
+// assignment of the saved value (which may itself be UNBOUND). A name
+// never written reads undefined, which gv treats as unbound exactly as
+// it treats UNBOUND, so no pre-fill is needed: a binding is never
+// undefined (array items are JSON values, the loop object is an object).
+
+const UNBOUND = Symbol('unbound');
+
+function gv(scope, root, name) {
+  const v = scope[name];
+  return (v === undefined || v === UNBOUND) ? root[name] : v;
+}
+
+function pathExpr(names) {
+  let e = 'gv(scope,root,' + JSON.stringify(names[0]) + ')';
+  for (let k = 1; k < names.length; k++) e += '?.' + names[k];
+  return e;
+}
+
+// Emit JS for instructions [i, end) into L. Jump targets are resolved
+// from the compiled code: an if's false target is the instruction just
+// past its else (or its endif), an else's jump is just past its endif,
+// a for's end is its endfor.
+function emitRange(code, i, end, L) {
+  while (i < end) {
+    const ins = code[i];
+    switch (ins[0]) {
+      case T_TEXT:
+        L.push('out.push(' + JSON.stringify(ins[1]) + ');');
+        i++;
+        break;
+      case T_OUT: {
+        const e = pathExpr(ins[1]);
+        L.push((ins[2] ? 'writeValue(' : 'writeValueEsc(') + e + ', out);');
+        i++;
+        break;
+      }
+      case T_IF: {
+        const falseTarget = ins[3];
+        const hasElse = code[falseTarget - 1][0] === T_ELSE;
+        const e = pathExpr(ins[1]);
+        const cond = ins[2] ? '!truthy(' + e + ')' : 'truthy(' + e + ')';
+        L.push('if (' + cond + ') {');
+        emitRange(code, i + 1, falseTarget - 1, L);
+        if (hasElse) {
+          const elseEnd = code[falseTarget - 1][1];
+          L.push('} else {');
+          emitRange(code, falseTarget, elseEnd - 1, L);
+          L.push('}');
+          i = elseEnd;
+        } else {
+          L.push('}');
+          i = falseTarget;
+        }
+        break;
+      }
+      case T_FOR: {
+        const endforIdx = ins[3];
+        const e = pathExpr(ins[2]);
+        const vs = JSON.stringify(ins[1]);
+        L.push('{ const _a = ' + e + '; if (Array.isArray(_a) && _a.length !== 0) {');
+        L.push('const _pv = scope[' + vs + '], _pl = scope.loop, _lo = { index: 0, first: true, last: false, length: _a.length };');
+        L.push('for (let _i = 0; _i < _a.length; _i++) { _lo.index = _i + 1; _lo.first = _i === 0; _lo.last = _i === _a.length - 1; scope[' + vs + '] = _a[_i]; scope.loop = _lo;');
+        emitRange(code, i + 1, endforIdx, L);
+        L.push('}');
+        L.push('scope[' + vs + '] = _pv; scope.loop = _pl;');
+        L.push('} }');
+        i = endforIdx + 1;
+        break;
+      }
+      case T_INCLUDE: {
+        const nm = JSON.stringify(ins[1]);
+        L.push('{ const _f = compiled[' + nm + ']; if (_f && depth < 8) _f(root, out, compiled, depth + 1, scope, truthy, writeValue, writeValueEsc, gv); }');
+        i++;
+        break;
+      }
+      default:
+        // T_ENDIF / T_ELSE / T_ENDFOR are consumed as range ends.
+        i++;
+        break;
+    }
+  }
+}
+
+function compileFunction(code) {
+  const L = [];
+  emitRange(code, 0, code.length, L);
+  return new Function('root', 'out', 'compiled', 'depth', 'scope', 'truthy', 'writeValue', 'writeValueEsc', 'gv', L.join('\n'));
+}
+
+// Templates are compiled lazily, on first render: only a handful of a
+// case's templates are ever rendered (the layouts, index, tag, tags and
+// what they include), so parsing and compiling the rest is pure overhead
+// — CPU in run() and dead bytecode for the collector. compiled holds the
+// raw source until then, then the function; a template that fails to
+// parse becomes null (never rendered) and is reported. ensureCompiled
+// also compiles the transitive includes of a template, so an include
+// always finds a function. It stores the function before recursing, so
+// a cyclic include terminates.
+let RUN_REPORT = null;
+function ensureCompiled(compiled, name) {
+  const cur = compiled[name];
+  if (!cur) return null;
+  if (typeof cur !== 'string') return cur;
+  const c = compileTemplate(cur);
+  if (!c.code) {
+    compiled[name] = null;
+    if (RUN_REPORT) RUN_REPORT.push('template "' + name + '": ' + c.reason);
+    return null;
+  }
+  const fn = compileFunction(c.code);
+  compiled[name] = fn;
+  for (const ins of c.code) if (ins[0] === T_INCLUDE) ensureCompiled(compiled, ins[1]);
+  return fn;
+}
+
 // Render a template by name (when it parsed) into a string. The top
 // render is depth 0: an include renders its template one deeper, while
 // the depth is under 8, so a template 8 deep still renders and one deeper
-// does not. The chunk array and the scope stack are scratch space reused
-// across renders: renderTemplate is never re-entered (includes call
-// renderCompiled directly), and both are empty again when a render ends.
+// does not. The chunk array is scratch space reused across renders
+// (renderTemplate is never re-entered: includes call the compiled
+// function directly), and is empty again when a render ends. scope is a
+// fresh null-prototype object per render, holding the loop bindings.
+// scope is a single module-level object reused across top-level renders:
+// renders are sequential, never nested (includes share the scope they
+// are called with), and every loop restores the binding it changed, so
+// the scope is clean again when a render ends — every name in it is
+// UNBOUND or absent, which gv reads as unbound.
 const RENDER_OUT = [];
-const RENDER_FRAMES = [];
+const RENDER_SCOPE = Object.create(null);
 function renderTemplate(name, compiled, root) {
-  const code = compiled[name];
-  if (!code) return '';
+  const fn = ensureCompiled(compiled, name);
+  if (!fn) return '';
   RENDER_OUT.length = 0;
-  RENDER_FRAMES.length = 0;
-  renderCompiled(code, compiled, root, RENDER_OUT, 0, RENDER_FRAMES);
+  fn(root, RENDER_OUT, compiled, 0, RENDER_SCOPE, truthy, writeValue, writeValueEsc, gv);
   return RENDER_OUT.join('');
 }
 
@@ -668,16 +828,24 @@ function resolveHref(target, ctx) {
   const hash = target.indexOf('#');
   const pathPart = hash === -1 ? target : target.slice(0, hash);
   const frag = hash === -1 ? '' : target.slice(hash);
-  const parts = ctx.dir === '' ? [] : ctx.dir.split('/');
-  const segs = pathPart.split('/');
-  for (let s = 0; s < segs.length; s++) {
-    const seg = segs[s];
-    if (seg === '' || seg === '.') continue;
-    if (seg === '..') {
-      if (parts.length > 0) parts.pop();
-      continue;
+  // The source directory's segments are split once per source (cached on
+  // the context) and copied per link, instead of re-splitting the same
+  // short string for every link; the target's segments are walked with
+  // indexOf instead of split, so no segment arrays are allocated.
+  const parts = ctx.dirParts.slice();
+  let start = 0;
+  while (true) {
+    const slash = pathPart.indexOf('/', start);
+    const seg = slash === -1 ? pathPart.slice(start) : pathPart.slice(start, slash);
+    if (seg !== '' && seg !== '.') {
+      if (seg === '..') {
+        if (parts.length > 0) parts.pop();
+      } else {
+        parts.push(seg);
+      }
     }
-    parts.push(seg);
+    if (slash === -1) break;
+    start = slash + 1;
   }
   const resolved = parts.join('/');
   const page = ctx.pageBySource.get(resolved);
@@ -1023,9 +1191,18 @@ function renderMarkdown(lines, start, ctx) {
           id = id + '-' + k;
         }
         headIds.add(id);
-        const html = inline(h.text, ctx);
-        if (h.level === 2 || h.level === 3) toc.push({ level: h.level, id, html });
-        out.push('<h', String(h.level), ' id="', id, '">', html, '</h', String(h.level), '>\n');
+        // Only h2/h3 headings need their html as a string (the toc);
+        // the rest write straight into out instead of building a string
+        // of their own.
+        if (h.level === 2 || h.level === 3) {
+          const html = inline(h.text, ctx);
+          toc.push({ level: h.level, id, html });
+          out.push('<h', String(h.level), ' id="', id, '">', html, '</h', String(h.level), '>\n');
+        } else {
+          out.push('<h', String(h.level), ' id="', id, '">');
+          inlineInto(h.text, ctx, out, 0, h.text.length);
+          out.push('</h', String(h.level), '>\n');
+        }
         i++;
         continue;
       }
@@ -1165,14 +1342,13 @@ export function run(input) {
   const staticSet = new Set();
   for (const f of statics) staticSet.add(f.path);
 
-  // 2. Templates, parsed in code-unit order of name.
+  // 2. Templates, in code-unit order of name. Only the sources are kept
+  // here; each template is parsed and compiled on first render (see
+  // ensureCompiled), because most of a case's templates are never used.
   const names = Object.keys(input.templates).sort();
   const compiled = {};
-  for (const name of names) {
-    const c = compileTemplate(input.templates[name]);
-    if (c.code) compiled[name] = c.code;
-    else report.push('template "' + name + '": ' + c.reason);
-  }
+  for (const name of names) compiled[name] = input.templates[name];
+  RUN_REPORT = report;
 
   // 3. Front matter, in the reference's check order.
   const kept = [];
@@ -1329,6 +1505,7 @@ export function run(input) {
   for (const s of kept) {
     ctx.src = s.path;
     ctx.dir = s.dir;
+    ctx.dirParts = s.dir === '' ? [] : s.dir.split('/');
     const md = renderMarkdown(s.lines, s.bodyStart, ctx);
     s.content = md.html;
     s.toc = md.toc;
@@ -1392,6 +1569,16 @@ export function run(input) {
 
   // Cards and page values.
   function cardOf(s) {
+    const tagObjs = [];
+    for (const t of s.tagList) {
+      const tag = tagBySlug.get(t.slug);
+      // A tag is the tag of its slug: the name it is first met with
+      // walking the posts, and its url; where no post has that slug, the
+      // source's own spelling and the url "".
+      tagObjs.push(tag
+        ? { name: tag.name, slug: t.slug, url: tag.url }
+        : { name: t.name, slug: t.slug, url: '' });
+    }
     return {
       title: s.fm.title,
       url: s.url,
@@ -1400,15 +1587,7 @@ export function run(input) {
       summary: s.fm.summary || '',
       excerpt: s.excerpt,
       reading_minutes: s.readingMinutes,
-      tags: s.tagList.map((t) => {
-        const tag = tagBySlug.get(t.slug);
-        // A tag is the tag of its slug: the name it is first met with
-        // walking the posts, and its url; where no post has that slug, the
-        // source's own spelling and the url "".
-        return tag
-          ? { name: tag.name, slug: t.slug, url: tag.url }
-          : { name: t.name, slug: t.slug, url: '' };
-      }),
+      tags: tagObjs,
     };
   }
   for (const p of posts) p.card = cardOf(p);
