@@ -20,21 +20,16 @@ const MONTHS = [
 const ESCAPES = {
   '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
 };
-const ESCAPE_RE = /[&<>"']/g;
-
-// HTML-escape a string; the five replacements of the reference's table.
-// Most strings hold none of the five, so one regex test short-circuits.
-const ESCAPE_TEST = /[&<>"']/;
-function esc(s) {
-  if (!ESCAPE_TEST.test(s)) return s;
-  return s.replace(ESCAPE_RE, (c) => ESCAPES[c]);
-}
 
 // The slug of a text: NFKD, combining marks dropped, A-Z lowered, each run
 // of characters other than a-z and 0-9 one '-', none at either end, cut to
 // 64 characters with a '-' left at the cut dropped, 'untitled' when empty.
 function slugOf(text) {
-  const decomposed = text.normalize('NFKD').replace(/\p{M}/gu, '');
+  // Pure ASCII needs no normalisation: NFKD is the identity on ASCII and
+  // ASCII holds no combining marks, so skip both passes for it.
+  const decomposed = /[^\x00-\x7F]/.test(text)
+    ? text.normalize('NFKD').replace(/\p{M}/gu, '')
+    : text;
   const parts = [];
   let dashed = true;
   for (let i = 0; i < decomposed.length; i++) {
@@ -449,7 +444,7 @@ function writeValue(v, out) {
 }
 
 function writeValueEsc(v, out) {
-  if (typeof v === 'string') out.push(esc(v));
+  if (typeof v === 'string') pushEsc(v, out);
   else if (typeof v === 'number') out.push(String(v));
   else if (typeof v === 'boolean') out.push(v ? 'true' : 'false');
   else if (Array.isArray(v)) {
@@ -601,8 +596,11 @@ function findEm(s, from) {
   return -1;
 }
 
-// Try to read a link starting at s[i] === '['. Returns { html, end } or null.
-function tryLink(s, i, ctx) {
+// Read a link starting at s[i] === '[' far enough to know it is one:
+// its text end, its target end and its target. Returns null when s[i]
+// opens no link. Pure: it neither resolves the href nor renders the text,
+// so the caller can flush the plain run before it first.
+function linkParts(s, i) {
   const n = s.length;
   let j = i + 1;
   let textEnd = -1;
@@ -625,9 +623,7 @@ function tryLink(s, i, ctx) {
   if (tEnd === -1) return null;
   const target = s.slice(tStart, tEnd);
   if (target === '' || /\s/.test(target)) return null;
-  const href = resolveHref(target, ctx);
-  const text = inline(s.slice(i + 1, textEnd), ctx);
-  return { html: '<a href="' + esc(href) + '">' + text + '</a>', end: tEnd + 1 };
+  return { textEnd, tEnd, target };
 }
 
 // A link's href: a target with a scheme, opening on '/' or '#', is kept as
@@ -679,37 +675,63 @@ function resolveHref(target, ctx) {
   return target;
 }
 
-// Any Markdown inline special: backslash, backtick, '*' or '['. Text with
-// none of them is plain text and only needs escaping.
-const INLINE_SPECIAL = /[\\`*\[]/;
+// HTML-escape s into out (an array of chunks): the five replacements of
+// the reference's table. One regex scan that pushes raw runs and entities
+// beats a test plus a replace with a callback per match, and writing into
+// the caller's array instead of allocating a joined string keeps the
+// caller from paying for a string of its own.
+const ESC_RE_G = /[&<>"']/g;
+function pushEsc(s, out) {
+  ESC_RE_G.lastIndex = 0;
+  let m;
+  let start = 0;
+  while ((m = ESC_RE_G.exec(s)) !== null) {
+    if (m.index > start) out.push(s.slice(start, m.index));
+    out.push(ESCAPES[m[0]]);
+    start = m.index + 1;
+  }
+  if (start < s.length) out.push(s.slice(start));
+}
 
-// The next inline special at or after from, or -1. One regex scan beats
-// four indexOf scans of the same run.
-const SPECIAL_RE_G = /[\\`*\[]/g;
-function nextSpecial(s, from) {
-  SPECIAL_RE_G.lastIndex = from;
-  const m = SPECIAL_RE_G.exec(s);
+// The next character that is either an inline special (backslash,
+// backtick, '*' or '[') or an HTML-escapable (& < > " '), at or after
+// from, or -1. One regex scan handles both: plain runs between matches
+// hold neither, so they are pushed raw, and escapables become entities
+// on the spot instead of paying an esc() call per run.
+const SCAN_RE_G = /[\\`*\[]|[&<>"']/g;
+function nextScan(s, from) {
+  SCAN_RE_G.lastIndex = from;
+  const m = SCAN_RE_G.exec(s);
   return m ? m.index : -1;
 }
 
-// Inline Markdown, left to right: escapes, code spans, strong, emphasis,
-// links; every other character written escaped. Raw HTML is text.
-// Plain runs are flushed as one slice instead of one string per character,
-// and the scan jumps from one special to the next.
-function inline(s, ctx) {
-  if (!INLINE_SPECIAL.test(s)) return esc(s);
-  const out = [];
+// Inline Markdown into out (an array of chunks), left to right: escapes,
+// code spans, strong, emphasis, links; every other character written
+// escaped. Raw HTML is text. The scan jumps from one special or escapable
+// to the next, so plain runs are pushed raw and escapables become their
+// entities inline; writing into the caller's array instead of joining a
+// string of its own keeps every nested span from allocating an array and
+// a string.
+function inlineInto(s, ctx, out) {
   let i = 0;
   const n = s.length;
   let bufStart = 0;
   while (true) {
-    const j = nextSpecial(s, i);
+    const j = nextScan(s, i);
     if (j === -1) break;
     i = j;
     const c = s.charCodeAt(i);
+    if (c === 38 || c === 60 || c === 62 || c === 34 || c === 39) {
+      // An escapable: flush the plain run raw, then its entity.
+      if (i > bufStart) out.push(s.slice(bufStart, i));
+      out.push(ESCAPES[s[i]]);
+      i++;
+      bufStart = i;
+      continue;
+    }
     if (c === 92) {
       if (i + 1 < n && isEscapableCode(s.charCodeAt(i + 1))) {
-        if (i > bufStart) out.push(esc(s.slice(bufStart, i)));
+        if (i > bufStart) out.push(s.slice(bufStart, i));
         out.push(s[i + 1]);
         i += 2;
         bufStart = i;
@@ -721,8 +743,10 @@ function inline(s, ctx) {
     if (c === 96) {
       const k = s.indexOf('`', i + 1);
       if (k !== -1 && k > i + 1) {
-        if (i > bufStart) out.push(esc(s.slice(bufStart, i)));
-        out.push('<code>', esc(s.slice(i + 1, k)), '</code>');
+        if (i > bufStart) out.push(s.slice(bufStart, i));
+        out.push('<code>');
+        pushEsc(s.slice(i + 1, k), out);
+        out.push('</code>');
         i = k + 1;
         bufStart = i;
       } else {
@@ -734,8 +758,10 @@ function inline(s, ctx) {
       if (s.charCodeAt(i + 1) === 42) {
         const k = findStrong(s, i + 2);
         if (k !== -1 && k > i + 2) {
-          if (i > bufStart) out.push(esc(s.slice(bufStart, i)));
-          out.push('<strong>', inline(s.slice(i + 2, k), ctx), '</strong>');
+          if (i > bufStart) out.push(s.slice(bufStart, i));
+          out.push('<strong>');
+          inlineInto(s.slice(i + 2, k), ctx, out);
+          out.push('</strong>');
           i = k + 2;
           bufStart = i;
         } else {
@@ -744,8 +770,10 @@ function inline(s, ctx) {
       } else {
         const k = findEm(s, i + 1);
         if (k !== -1 && k > i + 1) {
-          if (i > bufStart) out.push(esc(s.slice(bufStart, i)));
-          out.push('<em>', inline(s.slice(i + 1, k), ctx), '</em>');
+          if (i > bufStart) out.push(s.slice(bufStart, i));
+          out.push('<em>');
+          inlineInto(s.slice(i + 1, k), ctx, out);
+          out.push('</em>');
           i = k + 1;
           bufStart = i;
         } else {
@@ -755,17 +783,30 @@ function inline(s, ctx) {
       continue;
     }
     // c === 91, a '[' that may open a link.
-    const link = tryLink(s, i, ctx);
-    if (link) {
-      if (i > bufStart) out.push(esc(s.slice(bufStart, i)));
-      out.push(link.html);
-      i = link.end;
+    const lp = linkParts(s, i);
+    if (lp) {
+      const href = resolveHref(lp.target, ctx);
+      if (i > bufStart) out.push(s.slice(bufStart, i));
+      out.push('<a href="');
+      pushEsc(href, out);
+      out.push('">');
+      inlineInto(s.slice(i + 1, lp.textEnd), ctx, out);
+      out.push('</a>');
+      i = lp.tEnd + 1;
       bufStart = i;
     } else {
       i++;
     }
   }
-  if (n > bufStart) out.push(esc(s.slice(bufStart)));
+  if (n > bufStart) out.push(s.slice(bufStart));
+}
+
+// Inline Markdown to a string: the same scan, joined. Only the callers
+// that need the string itself (a heading's html, the first paragraph's
+// excerpt) use this; the rest write straight into their own array.
+function inline(s, ctx) {
+  const out = [];
+  inlineInto(s, ctx, out);
   return out.join('');
 }
 
@@ -778,7 +819,14 @@ function trimLine(s) {
 }
 
 function isBlank(s) {
-  for (let i = 0; i < s.length; i++) {
+  const n = s.length;
+  if (n === 0) return true;
+  // A line whose first character is not a space or tab cannot be blank,
+  // and most content lines start with one, so this one check settles it
+  // without scanning the whole line.
+  const c0 = s.charCodeAt(0);
+  if (c0 !== 32 && c0 !== 9) return false;
+  for (let i = 1; i < n; i++) {
     const c = s.charCodeAt(i);
     if (c !== 32 && c !== 9) return false;
   }
@@ -859,14 +907,16 @@ function listMarker(line) {
   return { ordered: true, num: Number(line.slice(0, i)), text: line.slice(i + 2) };
 }
 
-// Render one body to HTML. Returns { html, toc, excerpt }.
-function renderMarkdown(body, ctx) {
-  const lines = body.split('\n');
+// Render one body to HTML. Takes the source's split lines and the index of
+// the first body line (after the closing front-matter fence) instead of a
+// joined body string, so the caller never has to join the lines back
+// together and split them again. Returns { html, toc, excerpt }.
+function renderMarkdown(lines, start, ctx) {
   const out = [];
   const toc = [];
   let excerpt = null;
   const headIds = new Set();
-  let i = 0;
+  let i = start;
   const n = lines.length;
   while (i < n) {
     const line = lines[i];
@@ -877,16 +927,15 @@ function renderMarkdown(body, ctx) {
     const lang = fenceLang(line);
     if (lang !== null) {
       i++;
-      const buf = [];
-      while (i < n && !isFenceClose(lines[i])) {
-        buf.push(esc(lines[i]));
-        i++;
-      }
-      if (i < n) i++;
       out.push('<pre><code');
       if (lang !== '') out.push(' class="language-', lang, '"');
       out.push('>');
-      if (buf.length > 0) out.push(buf.join('\n'), '\n');
+      while (i < n && !isFenceClose(lines[i])) {
+        pushEsc(lines[i], out);
+        out.push('\n');
+        i++;
+      }
+      if (i < n) i++;
       out.push('</code></pre>\n');
       continue;
     }
@@ -920,7 +969,9 @@ function renderMarkdown(body, ctx) {
         i++;
       }
       if (q.length > 0) {
-        out.push('<blockquote>\n<p>', inline(q.join('\n'), ctx), '</p>\n</blockquote>\n');
+        out.push('<blockquote>\n<p>');
+        inlineInto(q.join('\n'), ctx, out);
+        out.push('</p>\n</blockquote>\n');
       } else {
         out.push('<blockquote>\n</blockquote>\n');
       }
@@ -959,7 +1010,9 @@ function renderMarkdown(body, ctx) {
         out.push('<ul>\n');
       }
       for (let k = 0; k < items.length; k++) {
-        out.push('<li>', inline(items[k], ctx), '</li>\n');
+        out.push('<li>');
+        inlineInto(items[k], ctx, out);
+        out.push('</li>\n');
       }
       out.push(ordered ? '</ol>\n' : '</ul>\n');
       continue;
@@ -984,9 +1037,17 @@ function renderMarkdown(body, ctx) {
       plines.push(trimLine(l));
       i++;
     }
-    const inner = inline(plines.join('\n'), ctx);
-    if (excerpt === null) excerpt = inner;
-    out.push('<p>', inner, '</p>\n');
+    // The first paragraph's inline text is the excerpt, so it alone
+    // needs the string; later paragraphs write straight into out.
+    if (excerpt === null) {
+      const inner = inline(plines.join('\n'), ctx);
+      excerpt = inner;
+      out.push('<p>', inner, '</p>\n');
+    } else {
+      out.push('<p>');
+      inlineInto(plines.join('\n'), ctx, out);
+      out.push('</p>\n');
+    }
   }
   return { html: out.join(''), toc, excerpt: excerpt === null ? '' : excerpt };
 }
@@ -1003,6 +1064,24 @@ function dirOf(path) {
 const WS = new Uint8Array(65536);
 for (const c of [32, 9, 10, 11, 12, 13, 0x85, 0xa0, 0x1680, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000, 0xfeff]) WS[c] = 1;
 for (let c = 0x2000; c <= 0x200a; c++) WS[c] = 1;
+
+// Words in the body lines from start on: same count as wordsOf over the
+// joined body, because a word never spans the '\n' between two lines.
+function wordsOfLines(lines, start) {
+  let count = 0;
+  for (let k = start; k < lines.length; k++) {
+    const s = lines[k];
+    let inWord = false;
+    for (let i = 0; i < s.length; i++) {
+      if (WS[s.charCodeAt(i)]) inWord = false;
+      else if (!inWord) {
+        inWord = true;
+        count++;
+      }
+    }
+  }
+  return count;
+}
 
 function wordsOf(body) {
   let count = 0;
@@ -1145,7 +1224,8 @@ export function run(input) {
       isPost,
       fm,
       layout,
-      body: lines.slice(close + 1).join('\n'),
+      lines,
+      bodyStart: close + 1,
     });
   }
 
@@ -1195,11 +1275,11 @@ export function run(input) {
   for (const s of kept) {
     ctx.src = s.path;
     ctx.dir = s.dir;
-    const md = renderMarkdown(s.body, ctx);
+    const md = renderMarkdown(s.lines, s.bodyStart, ctx);
     s.content = md.html;
     s.toc = md.toc;
     s.excerpt = md.excerpt;
-    s.readingMinutes = Math.max(1, Math.ceil(wordsOf(s.body) / 200));
+    s.readingMinutes = Math.max(1, Math.ceil(wordsOfLines(s.lines, s.bodyStart) / 200));
   }
 
   // 6. Collections: the posts, newest date first, equal dates by slug.

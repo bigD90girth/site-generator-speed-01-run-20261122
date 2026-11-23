@@ -4,7 +4,7 @@
 // TypeScript as it is. Outside a container, MAKEFUN_INPUT_DIR and
 // MAKEFUN_OUTPUT_DIR stand in for /input and /output.
 
-import { readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync, openSync, writeSync, closeSync } from 'node:fs';
 import { join } from 'node:path';
 import { setFlagsFromString } from 'node:v8';
 
@@ -25,7 +25,16 @@ const cases = JSON.parse(readFileSync(join(inDir, 'cases.json'), 'utf8')) as Arr
   input: unknown;
 }>;
 
-const answers: unknown[] = [];
-for (let i = 0; i < cases.length; i++) answers.push(run(cases[i].input));
-
-writeFileSync(join(outDir, 'answers.json'), JSON.stringify(answers));
+// Answer one case at a time and write its JSON straight to the file, so
+// only one case's answer is ever alive at once: the answers are never all
+// held in memory together, and the big stringified whole is never built.
+// The bytes written are exactly JSON.stringify of the answers array:
+// '[' + each answer's JSON, comma-separated + ']'.
+const fd = openSync(join(outDir, 'answers.json'), 'w');
+writeSync(fd, '[');
+for (let i = 0; i < cases.length; i++) {
+  if (i > 0) writeSync(fd, ',');
+  writeSync(fd, JSON.stringify(run(cases[i].input)));
+}
+writeSync(fd, ']');
+closeSync(fd);
