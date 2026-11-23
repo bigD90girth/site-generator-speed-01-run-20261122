@@ -23,12 +23,10 @@ const ESCAPES = {
 const ESCAPE_RE = /[&<>"']/g;
 
 // HTML-escape a string; the five replacements of the reference's table.
-// Most strings hold none of the five, so the indexOf checks short-circuit.
+// Most strings hold none of the five, so one regex test short-circuits.
+const ESCAPE_TEST = /[&<>"']/;
 function esc(s) {
-  if (
-    s.indexOf('&') === -1 && s.indexOf('<') === -1 && s.indexOf('>') === -1 &&
-    s.indexOf('"') === -1 && s.indexOf("'") === -1
-  ) return s;
+  if (!ESCAPE_TEST.test(s)) return s;
   return s.replace(ESCAPE_RE, (c) => ESCAPES[c]);
 }
 
@@ -37,19 +35,20 @@ function esc(s) {
 // 64 characters with a '-' left at the cut dropped, 'untitled' when empty.
 function slugOf(text) {
   const decomposed = text.normalize('NFKD').replace(/\p{M}/gu, '');
-  let out = '';
+  const parts = [];
   let dashed = true;
   for (let i = 0; i < decomposed.length; i++) {
     let c = decomposed.charCodeAt(i);
     if (c >= 65 && c <= 90) c += 32;
     if ((c >= 97 && c <= 122) || (c >= 48 && c <= 57)) {
-      out += String.fromCharCode(c);
+      parts.push(String.fromCharCode(c));
       dashed = false;
     } else if (!dashed) {
-      out += '-';
+      parts.push('-');
       dashed = true;
     }
   }
+  let out = parts.join('');
   if (dashed && out.length > 0) out = out.slice(0, -1);
   if (out.length > 64) {
     out = out.slice(0, 64);
@@ -67,13 +66,21 @@ function isLeap(y) {
   return y % 4 === 0 && (y % 100 !== 0 || y % 400 === 0);
 }
 
+const DIM = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
 function validDate(d) {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) return false;
+  if (d.length !== 10) return false;
+  if (d.charCodeAt(4) !== 45 || d.charCodeAt(7) !== 45) return false;
+  for (let i = 0; i < 10; i++) {
+    if (i === 4 || i === 7) continue;
+    const c = d.charCodeAt(i);
+    if (c < 48 || c > 57) return false;
+  }
   const y = Number(d.slice(0, 4));
   const m = Number(d.slice(5, 7));
   const day = Number(d.slice(8, 10));
   if (m < 1 || m > 12 || day < 1) return false;
-  const dim = [31, isLeap(y) ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][m - 1];
+  const dim = m === 2 && isLeap(y) ? 29 : DIM[m - 1];
   if (day > dim) return false;
   return d >= '1970-01-01' && d <= '2099-12-31';
 }
@@ -82,24 +89,30 @@ function validDate(d) {
 
 const KNOWN_KEYS = new Set(['title', 'summary', 'date', 'tags', 'draft', 'layout', 'slug']);
 
-// Read a quoted string value starting at value[0] === '"'. Returns the
-// unescaped string, or null when no closing quote is found. The closing
-// quote must be the value's last character: a quoted string followed by
-// more text is refused as not closed.
+// Read a quoted string value starting at value[0] === '"'. The closing
+// quote must be the value's last character; a quote inside it is a stray
+// quote, and a backslash inside it must escape " or \. Returns
+// { value } or { reason }.
 function readQuoted(value) {
+  if (value.length < 2 || value[value.length - 1] !== '"') {
+    return { reason: 'a quoted string is not closed' };
+  }
   let out = '';
-  for (let p = 1; p < value.length; p++) {
+  for (let p = 1; p < value.length - 1; p++) {
     const ch = value[p];
-    if (ch === '\\' && p + 1 < value.length && (value[p + 1] === '"' || value[p + 1] === '\\')) {
+    if (ch === '\\') {
+      if (p + 1 > value.length - 2 || (value[p + 1] !== '"' && value[p + 1] !== '\\')) {
+        return { reason: 'a quoted string holds an escape other than \\" or \\\\' };
+      }
       out += value[p + 1];
       p++;
     } else if (ch === '"') {
-      return p === value.length - 1 ? out : null;
+      return { reason: 'a quoted string holds a stray quote' };
     } else {
       out += ch;
     }
   }
-  return null;
+  return { value: out };
 }
 
 // Validate one front-matter value by its key. Returns the parsed value, or
@@ -108,11 +121,11 @@ function valueOf(key, value, fault) {
   if (key === 'title' || key === 'summary') {
     if (value[0] === '"') {
       const q = readQuoted(value);
-      if (q === null) {
-        fault.reason = 'key "' + key + '": a quoted string is not closed';
+      if (q.reason) {
+        fault.reason = 'key "' + key + '": ' + q.reason;
         return undefined;
       }
-      return q;
+      return q.value;
     }
     if (value[0] === '[') {
       fault.reason = 'key "' + key + '": a bare string opens on [';
@@ -153,7 +166,7 @@ function valueOf(key, value, fault) {
     return value === 'true';
   }
   if (key === 'slug') {
-    if (!/^[a-z0-9]+(-[a-z0-9]+)*$/.test(value) || value.length > 64) {
+    if (!isSlug(value)) {
       fault.reason = 'key "slug": not a slug';
       return undefined;
     }
@@ -161,6 +174,26 @@ function valueOf(key, value, fault) {
   }
   // layout: kept as written; the template lookup decides it later.
   return value;
+}
+
+// A slug value: lowercase letters, digits and single '-' between runs,
+// no '-' at either end, at most 64 characters.
+function isSlug(v) {
+  if (v.length === 0 || v.length > 64) return false;
+  let prevDash = true;
+  for (let i = 0; i < v.length; i++) {
+    const c = v.charCodeAt(i);
+    if ((c >= 97 && c <= 122) || (c >= 48 && c <= 57)) {
+      prevDash = false;
+      continue;
+    }
+    if (c === 45 && !prevDash) {
+      prevDash = true;
+      continue;
+    }
+    return false;
+  }
+  return !prevDash;
 }
 
 // ------------------------------------------------------------------ templates
@@ -499,12 +532,15 @@ function renderCompiled(code, compiled, root, out, depth, frames) {
   }
 }
 
-// Render a template by name (when it parsed) into a string.
+// Render a template by name (when it parsed) into a string. The top
+// render is depth 0: an include renders its template one deeper, while
+// the depth is under 8, so a template 8 deep still renders and one deeper
+// does not.
 function renderTemplate(name, compiled, root) {
   const code = compiled[name];
   if (!code) return '';
   const out = [];
-  renderCompiled(code, compiled, root, out, 1, []);
+  renderCompiled(code, compiled, root, out, 0, []);
   return out.join('');
 }
 
@@ -599,8 +635,23 @@ function tryLink(s, i, ctx) {
 // '#' fragment: the url of the page built from that source, or
 // <base>/<path> of a static file. A target naming neither is a broken link,
 // reported once per (source, target), and kept as written.
+// A target with a scheme: a letter, then letters, digits, '+', '-' or '.',
+// then ':'.
+function isScheme(t) {
+  const c0 = t.charCodeAt(0);
+  if (!((c0 >= 65 && c0 <= 90) || (c0 >= 97 && c0 <= 122))) return false;
+  for (let i = 1; i < t.length; i++) {
+    const c = t.charCodeAt(i);
+    if (c === 58) return true;
+    if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) ||
+      c === 43 || c === 45 || c === 46) continue;
+    return false;
+  }
+  return false;
+}
+
 function resolveHref(target, ctx) {
-  if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(target)) return target;
+  if (isScheme(target)) return target;
   if (target[0] === '/' || target[0] === '#') return target;
   const hash = target.indexOf('#');
   const pathPart = hash === -1 ? target : target.slice(0, hash);
@@ -628,84 +679,93 @@ function resolveHref(target, ctx) {
   return target;
 }
 
+// Any Markdown inline special: backslash, backtick, '*' or '['. Text with
+// none of them is plain text and only needs escaping.
+const INLINE_SPECIAL = /[\\`*\[]/;
+
+// The next inline special at or after from, or -1. One regex scan beats
+// four indexOf scans of the same run.
+const SPECIAL_RE_G = /[\\`*\[]/g;
+function nextSpecial(s, from) {
+  SPECIAL_RE_G.lastIndex = from;
+  const m = SPECIAL_RE_G.exec(s);
+  return m ? m.index : -1;
+}
+
 // Inline Markdown, left to right: escapes, code spans, strong, emphasis,
 // links; every other character written escaped. Raw HTML is text.
+// Plain runs are flushed as one slice instead of one string per character,
+// and the scan jumps from one special to the next.
 function inline(s, ctx) {
+  if (!INLINE_SPECIAL.test(s)) return esc(s);
   const out = [];
-  let buf = '';
   let i = 0;
   const n = s.length;
-  while (i < n) {
-    const c = s[i];
-    if (c === '\\' && i + 1 < n && isEscapableCode(s.charCodeAt(i + 1))) {
-      buf += s[i + 1];
-      i += 2;
-      continue;
-    }
-    if (c === '`') {
-      const j = s.indexOf('`', i + 1);
-      if (j !== -1 && j > i + 1) {
-        if (buf !== '') {
-          out.push(esc(buf));
-          buf = '';
-        }
-        out.push('<code>', esc(s.slice(i + 1, j)), '</code>');
-        i = j + 1;
-        continue;
-      }
-      buf += '`';
-      i++;
-      continue;
-    }
-    if (c === '*') {
-      if (s[i + 1] === '*') {
-        const j = findStrong(s, i + 2);
-        if (j !== -1 && j > i + 2) {
-          if (buf !== '') {
-            out.push(esc(buf));
-            buf = '';
-          }
-          out.push('<strong>', inline(s.slice(i + 2, j), ctx), '</strong>');
-          i = j + 2;
-          continue;
-        }
-        buf += '**';
+  let bufStart = 0;
+  while (true) {
+    const j = nextSpecial(s, i);
+    if (j === -1) break;
+    i = j;
+    const c = s.charCodeAt(i);
+    if (c === 92) {
+      if (i + 1 < n && isEscapableCode(s.charCodeAt(i + 1))) {
+        if (i > bufStart) out.push(esc(s.slice(bufStart, i)));
+        out.push(s[i + 1]);
         i += 2;
-        continue;
+        bufStart = i;
+      } else {
+        i++;
       }
-      const j = findEm(s, i + 1);
-      if (j !== -1 && j > i + 1) {
-        if (buf !== '') {
-          out.push(esc(buf));
-          buf = '';
-        }
-        out.push('<em>', inline(s.slice(i + 1, j), ctx), '</em>');
-        i = j + 1;
-        continue;
-      }
-      buf += '*';
-      i++;
       continue;
     }
-    if (c === '[') {
-      const link = tryLink(s, i, ctx);
-      if (link) {
-        if (buf !== '') {
-          out.push(esc(buf));
-          buf = '';
-        }
-        out.push(link.html);
-        i = link.end;
-        continue;
+    if (c === 96) {
+      const k = s.indexOf('`', i + 1);
+      if (k !== -1 && k > i + 1) {
+        if (i > bufStart) out.push(esc(s.slice(bufStart, i)));
+        out.push('<code>', esc(s.slice(i + 1, k)), '</code>');
+        i = k + 1;
+        bufStart = i;
+      } else {
+        i++;
       }
-      buf += '[';
-      i++;
       continue;
     }
-    buf += c;
-    i++;
+    if (c === 42) {
+      if (s.charCodeAt(i + 1) === 42) {
+        const k = findStrong(s, i + 2);
+        if (k !== -1 && k > i + 2) {
+          if (i > bufStart) out.push(esc(s.slice(bufStart, i)));
+          out.push('<strong>', inline(s.slice(i + 2, k), ctx), '</strong>');
+          i = k + 2;
+          bufStart = i;
+        } else {
+          i += 2;
+        }
+      } else {
+        const k = findEm(s, i + 1);
+        if (k !== -1 && k > i + 1) {
+          if (i > bufStart) out.push(esc(s.slice(bufStart, i)));
+          out.push('<em>', inline(s.slice(i + 1, k), ctx), '</em>');
+          i = k + 1;
+          bufStart = i;
+        } else {
+          i++;
+        }
+      }
+      continue;
+    }
+    // c === 91, a '[' that may open a link.
+    const link = tryLink(s, i, ctx);
+    if (link) {
+      if (i > bufStart) out.push(esc(s.slice(bufStart, i)));
+      out.push(link.html);
+      i = link.end;
+      bufStart = i;
+    } else {
+      i++;
+    }
   }
-  if (buf !== '') out.push(esc(buf));
+  if (n > bufStart) out.push(esc(s.slice(bufStart)));
   return out.join('');
 }
 
@@ -728,24 +788,40 @@ function isBlank(s) {
 // A fence opener: ``` plus an optional language, then spaces/tabs only.
 // Returns the language, or null when the line is not a fence opener.
 function fenceLang(line) {
-  if (line[0] !== '`' || line[1] !== '`' || line[2] !== '`') return null;
-  const m = /^```([A-Za-z0-9_+\-]*)[ \t]*$/.exec(line);
-  return m ? m[1] : null;
+  if (line.charCodeAt(0) !== 96 || line.charCodeAt(1) !== 96 || line.charCodeAt(2) !== 96) return null;
+  let i = 3;
+  while (i < line.length) {
+    const c = line.charCodeAt(i);
+    if ((c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) ||
+      c === 95 || c === 43 || c === 45) i++;
+    else break;
+  }
+  const lang = line.slice(3, i);
+  while (i < line.length && (line.charCodeAt(i) === 32 || line.charCodeAt(i) === 9)) i++;
+  return i === line.length ? lang : null;
 }
 
 function isFenceClose(line) {
-  return /^```[ \t]*$/.test(line);
+  if (line.charCodeAt(0) !== 96 || line.charCodeAt(1) !== 96 || line.charCodeAt(2) !== 96) return false;
+  for (let i = 3; i < line.length; i++) {
+    const c = line.charCodeAt(i);
+    if (c !== 32 && c !== 9) return false;
+  }
+  return true;
 }
 
 // A heading: 1-6 '#', at least one space/tab, then text. Returns
 // { level, text } or null.
 function headingOf(line) {
   if (line.charCodeAt(0) !== 35) return null;
-  const m = /^(#{1,6})[ \t]+(.*)$/.exec(line);
-  if (!m) return null;
-  const text = trimEndSpaces(m[2]);
+  let level = 0;
+  while (level < line.length && line.charCodeAt(level) === 35) level++;
+  if (level === 0 || level > 6) return null;
+  const c = line.charCodeAt(level);
+  if (c !== 32 && c !== 9) return null;
+  const text = trimEndSpaces(line.slice(level + 1));
   if (text === '') return null;
-  return { level: m[1].length, text };
+  return { level, text };
 }
 
 function trimEndSpaces(s) {
@@ -757,7 +833,12 @@ function trimEndSpaces(s) {
 function isBreak(line) {
   const c = line.charCodeAt(0);
   if (c !== 45 && c !== 42) return false;
-  return /^(---|\*\*\*)[ \t]*$/.test(line);
+  if (line.charCodeAt(1) !== c || line.charCodeAt(2) !== c) return false;
+  for (let i = 3; i < line.length; i++) {
+    const d = line.charCodeAt(i);
+    if (d !== 32 && d !== 9) return false;
+  }
+  return true;
 }
 
 // A list item marker. Returns { ordered, num, text } or null.
@@ -768,9 +849,14 @@ function listMarker(line) {
     return null;
   }
   if (c0 < 48 || c0 > 57) return null;
-  const m = /^(\d+)\. (.*)$/.exec(line);
-  if (m) return { ordered: true, num: Number(m[1]), text: m[2] };
-  return null;
+  let i = 0;
+  while (i < line.length) {
+    const c = line.charCodeAt(i);
+    if (c < 48 || c > 57) break;
+    i++;
+  }
+  if (line.charCodeAt(i) !== 46 || line.charCodeAt(i + 1) !== 32) return null;
+  return { ordered: true, num: Number(line.slice(0, i)), text: line.slice(i + 2) };
 }
 
 // Render one body to HTML. Returns { html, toc, excerpt }.
@@ -800,9 +886,7 @@ function renderMarkdown(body, ctx) {
       out.push('<pre><code');
       if (lang !== '') out.push(' class="language-', lang, '"');
       out.push('>');
-      for (let b = 0; b < buf.length; b++) {
-        out.push(buf[b], '\n');
-      }
+      if (buf.length > 0) out.push(buf.join('\n'), '\n');
       out.push('</code></pre>\n');
       continue;
     }
@@ -881,14 +965,22 @@ function renderMarkdown(body, ctx) {
       continue;
     }
     // A paragraph: this line and the lines after it up to a blank line, a
-    // fence, a heading or a thematic break.
+    // fence, a heading or a thematic break. Most lines are plain text, so
+    // the first character decides which checks can even apply.
     const plines = [];
     while (i < n) {
       const l = lines[i];
-      if (isBlank(l)) break;
-      if (fenceLang(l) !== null) break;
-      if (headingOf(l)) break;
-      if (isBreak(l)) break;
+      if (l.length === 0) break;
+      const c0 = l.charCodeAt(0);
+      if (c0 === 32 || c0 === 9) {
+        if (isBlank(l)) break;
+      } else if (c0 === 96) {
+        if (fenceLang(l) !== null) break;
+      } else if (c0 === 35) {
+        if (headingOf(l)) break;
+      } else if (c0 === 45 || c0 === 42) {
+        if (isBreak(l)) break;
+      }
       plines.push(trimLine(l));
       i++;
     }
@@ -906,15 +998,17 @@ function dirOf(path) {
   return k === -1 ? '' : path.slice(0, k);
 }
 
+// Whitespace by the reference's own list, as one table lookup per code
+// unit instead of a chain of comparisons.
+const WS = new Uint8Array(65536);
+for (const c of [32, 9, 10, 11, 12, 13, 0x85, 0xa0, 0x1680, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000, 0xfeff]) WS[c] = 1;
+for (let c = 0x2000; c <= 0x200a; c++) WS[c] = 1;
+
 function wordsOf(body) {
   let count = 0;
   let inWord = false;
   for (let i = 0; i < body.length; i++) {
-    const c = body.charCodeAt(i);
-    const ws = c === 32 || c === 9 || c === 10 || c === 11 || c === 12 || c === 13 ||
-      c === 0x85 || c === 0xa0 || c === 0x1680 || (c >= 0x2000 && c <= 0x200a) ||
-      c === 0x2028 || c === 0x2029 || c === 0x202f || c === 0x205f || c === 0x3000 || c === 0xfeff;
-    if (ws) inWord = false;
+    if (WS[body.charCodeAt(i)]) inWord = false;
     else if (!inWord) {
       inWord = true;
       count++;
@@ -956,7 +1050,9 @@ export function run(input) {
   const kept = [];
   for (const f of sources) {
     const path = f.path;
-    const content = f.content.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    const content = f.content.indexOf('\r') === -1
+      ? f.content
+      : f.content.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
     const lines = content.split('\n');
     if (lines[0] !== '---') {
       report.push('refused ' + path + ': no front matter');
@@ -979,15 +1075,20 @@ export function run(input) {
     for (let k = 1; k < close && !fault.reason; k++) {
       const line = lines[k];
       const n = k + 1;
-      if (/^[ \t]*$/.test(line)) continue;
+      if (isBlank(line)) continue;
       if (line[0] === '#') continue;
-      const m = /^([a-z_]+):(.*)$/.exec(line);
-      if (!m) {
+      let ci = 0;
+      while (ci < line.length) {
+        const cc = line.charCodeAt(ci);
+        if ((cc >= 97 && cc <= 122) || cc === 95) ci++;
+        else break;
+      }
+      if (ci === 0 || line.charCodeAt(ci) !== 58) {
         fault.reason = 'line ' + n + ' is not "key: value"';
         break;
       }
-      const key = m[1];
-      const rest = m[2];
+      const key = line.slice(0, ci);
+      const rest = line.slice(ci + 1);
       if (rest !== '' && rest[0] !== ' ') {
         fault.reason = 'line ' + n + ' is not "key: value"';
         break;
@@ -1082,16 +1183,18 @@ export function run(input) {
   const pageBySource = new Map();
   for (const s of kept) pageBySource.set(s.path, s.url);
   const brokenSeen = new Set();
+  const ctx = {
+    src: '',
+    dir: '',
+    pageBySource,
+    statics: staticSet,
+    base,
+    brokenSeen,
+    report,
+  };
   for (const s of kept) {
-    const ctx = {
-      src: s.path,
-      dir: s.dir,
-      pageBySource,
-      statics: staticSet,
-      base,
-      brokenSeen,
-      report,
-    };
+    ctx.src = s.path;
+    ctx.dir = s.dir;
     const md = renderMarkdown(s.body, ctx);
     s.content = md.html;
     s.toc = md.toc;
@@ -1263,14 +1366,18 @@ export function run(input) {
   }
 
   // Each static file at its own path, unless a built page has that path.
+  // Every static counts in the total, shadowed or not, and a written
+  // static's path is taken, so a second file at the same path is shadowed
+  // too and the first one stays.
   let staticWritten = 0;
   for (const f of statics) {
+    staticWritten++;
     if (written.has(f.path)) {
       report.push('shadowed ' + f.path + ': a built page has its path');
       continue;
     }
     out[f.path] = f.content;
-    staticWritten++;
+    written.add(f.path);
   }
 
   // 9. The report.
